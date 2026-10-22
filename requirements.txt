@@ -7,3 +7,4 @@ langchain-google-genai>=2.1,<5
 langchain-chroma>=1.0,<2
 chromadb>=1.0,<2
 pypdf>=5.0,<7
+psycopg[binary]>=3.2,<4

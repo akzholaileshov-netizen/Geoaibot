@@ -329,17 +329,21 @@ def _open_client() -> chromadb.ClientAPI | None:
     return _client
 
 
+def _has_database_url() -> bool:
+    return bool(os.getenv("DATABASE_URL", "").strip())
+
+
 def _start_textbook_index() -> str:
     """Start ingest.py once only when unt_geography_v2 is absent.
 
-    An existing collection is ready. A running ingest is not started again,
-    and it does not hide the collection from later questions.
+    Supabase is the textbook source when DATABASE_URL is set, so ingest
+    is not started there. An existing local collection is also ready.
     """
     global _client, _ingest_proc
-    if _collection_recorded():
+    if _has_database_url() or _collection_recorded():
         return "ready"
     with _ingest_lock:
-        if _collection_recorded():
+        if _has_database_url() or _collection_recorded():
             return "ready"
         if _ingest_marked_running():
             return "running"
@@ -746,7 +750,7 @@ def candidate_pool(
     question: str, api_key: str, k: int = TOP_K, also: str = ""
 ) -> list[tuple[Document, float]] | None:
     """Semantic neighbors. A keyword or a synonym never drops one of them."""
-    if _textbook_remote_ready():
+    if _has_database_url():
         return _remote_candidate_pool(question, api_key, k, also)
     scores = _query_scores(question, api_key, also)
     if scores is None:
@@ -1790,7 +1794,7 @@ async def answer_question(question: str, api_key: str) -> str:
         candidate_pool, search_query, api_key, RAG_TOP_K, question
     )
     if found is None:
-        if _textbook_remote_ready() or _collection_recorded():
+        if _has_database_url() or _collection_recorded():
             return API_ERROR
         return PREPARING_DB
     if not found:
@@ -3622,7 +3626,7 @@ async def _answer_from_books(message: Message, question: str, api_key: str) -> N
             interval=TYPING_INTERVAL,
             initial_sleep=0,
         ):
-            if _textbook_remote_ready() or _collection_recorded():
+            if _has_database_url() or _collection_recorded():
                 text = await answer_question(question, api_key)
             else:
                 text = PREPARING_DB
