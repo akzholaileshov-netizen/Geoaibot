@@ -6,6 +6,7 @@ import os
 import random
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -173,7 +174,7 @@ FALLBACK_PROMPT = (
     "Жауапты дәл мына жолмен бітір, бөлек жолда:\n"
     "(💡 Жалпы географиялық білім қорынан)"
 )
-MISSING_DB = "Дерекқор табылмады. Алдымен ingest.py скриптін іске қосыңыз."
+PREPARING_DB = "Оқулықтар дайындалып жатыр. Дайын болған соң сұрағыңызды жіберіңіз."
 API_ERROR = "Қате шықты. Сәл кейінірек қайталап көріңіз."
 ONE_QUESTION_USED = "Сіздің бір сұрағыңыз қолданылып қойды."
 ASKED_PATH = ROOT / "data" / "asked_users.json"
@@ -186,6 +187,8 @@ _client: chromadb.ClientAPI | None = None
 _embeddings: GoogleGenerativeAIEmbeddings | None = None
 _llm: ChatGoogleGenerativeAI | None = None
 _index_lock = threading.Lock()
+_ingest_lock = threading.Lock()
+_ingest_proc: subprocess.Popen[bytes] | None = None
 _cheer_lock = threading.Lock()
 _cheer_index = 0
 _asked_lock = threading.Lock()
@@ -298,6 +301,33 @@ def _open_client() -> chromadb.ClientAPI | None:
     if COLLECTION_NAME not in _collection_names(_client):
         return None
     return _client
+
+
+def _start_textbook_index() -> str:
+    """Start ingest.py once when its Chroma collection is missing.
+
+    Returns ready, running, started, or failed. A later tap does not launch
+    another process while the first is alive or after the collection exists.
+    """
+    global _client, _ingest_proc
+    if _matrix is not None or _open_client() is not None:
+        return "ready"
+    with _ingest_lock:
+        if _matrix is not None or _open_client() is not None:
+            return "ready"
+        if _ingest_proc is not None and _ingest_proc.poll() is None:
+            return "running"
+        _client = None
+        try:
+            _ingest_proc = subprocess.Popen(
+                [sys.executable, str(ROOT / "ingest.py")],
+                cwd=str(ROOT),
+                start_new_session=True,
+            )
+        except OSError:
+            _ingest_proc = None
+            return "failed"
+        return "started"
 
 
 def _usable(text: str) -> bool:
@@ -1586,7 +1616,7 @@ async def answer_question(question: str, api_key: str) -> str:
         candidate_pool, search_query, api_key, RAG_TOP_K, question
     )
     if found is None:
-        return MISSING_DB
+        return PREPARING_DB
     if not found:
         return _not_found_answer()
     pool_docs = [doc for doc, _score in found]
@@ -3153,6 +3183,13 @@ async def on_ask_mode(query: CallbackQuery) -> None:
                 _save_progress(conn, str(sender.id), state)
             finally:
                 conn.close()
+    index_state = _start_textbook_index()
+    if index_state != "ready":
+        if query.message is not None:
+            await query.message.answer(
+                API_ERROR if index_state == "failed" else PREPARING_DB
+            )
+        return
     if query.message is not None:
         await query.message.answer(_ask_intro_for(sender.id if sender is not None else None))
 
@@ -3434,7 +3471,7 @@ async def on_question(message: Message, api_key: str) -> None:
         ):
             try:
                 if _open_client() is None:
-                    await _deliver_answer(pending, MISSING_DB)
+                    await _deliver_answer(pending, PREPARING_DB)
                     return
                 await _deliver_answer(pending, await answer_question(question, api_key))
             except Exception:
