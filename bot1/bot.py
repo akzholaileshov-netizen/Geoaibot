@@ -3457,4 +3457,5 @@ async def main() -> None:
         stream=sys.stdout,
     )
     asyncio.create_task(_subscription_loop())
-    await dp1.start_polling(bot1)
+    await bot1.delete_webhook(drop_pending_updates=True)
+    await dp1.start_polling(bot1, drop_pending_updates=True)
