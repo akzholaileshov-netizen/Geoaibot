@@ -8,8 +8,11 @@ import re
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timezone
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import chromadb
@@ -1688,6 +1691,11 @@ SECTION_CLOSED = (
     "\n"
     "ҰБТ & Олимпиадада 19 оқулықтың базасын толық ашып, 1500+ сұрақ пен AI түсіндірмелерге толық доступ алу үшін VIP-ке қосыл 🚀"
 )
+VIP_REMINDER = (
+    "⚠️ Құрметті оқушы! Сіздің GeoHub VIP базаңызды пайдалану мерзімі бітуге жақын (1 күн қалды). "
+    "Базаға шектеусіз кіру мүмкіндігін сақтап қалу және жаңартылған жаңа сұрақтарға доступ алу үшін "
+    "жазылымды ұзартуды ұмытпаңыз!"
+)
 RECEIPT_PROMPT = "Төлем чегінің скриншотын осында жіберіңіз:"
 CARD_DIGITS = "4400430045714687"
 PHONE_NUMBER = "+77058951332"
@@ -1772,6 +1780,12 @@ def _menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=BTN_QUIZ, callback_data="mode:quiz")],
             [InlineKeyboardButton(text=BTN_ASK, callback_data="mode:ask")],
+            [
+                InlineKeyboardButton(
+                    text="📚 Спецификация кітаптары",
+                    url="https://drive.google.com/drive/folders/1Q-5it1Ul3-i3eaBqZz4_v7aoNkL8Vxnb",
+                )
+            ],
             [InlineKeyboardButton(text="🤖 Негізгі ботқа өту", url="https://t.me/geomachinebot")],
         ]
     )
@@ -1849,8 +1863,58 @@ def _benefits_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _private_channel_url() -> str:
-    return os.getenv("PRIVATE_CHANNEL_URL", "").strip()
+_INVITE_ADMIN_HINT = (
+    "Бір реттік сілтеме жасалмады. Бот канал әкімшісі болуы керек "
+    "және пайдаланушыларды шақыру құқығы болуы керек."
+)
+
+
+def _channel_chat_id() -> int | str | None:
+    """Chat id or @username. A permanent t.me/+ invite is not a chat id."""
+    raw = os.getenv("PRIVATE_CHANNEL_URL", "").strip()
+    if not raw:
+        return None
+    if raw.startswith("@"):
+        return raw
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    text = raw
+    for prefix in ("https://", "http://"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if text.startswith("t.me/"):
+        text = text[len("t.me/"):]
+    slug = text.split("?", 1)[0].strip("/")
+    if not slug or slug.startswith("+") or slug.startswith("joinchat/"):
+        return None
+    if slug.startswith("c/"):
+        parts = slug.split("/")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(f"-100{parts[1]}")
+        return None
+    username = slug.split("/", 1)[0]
+    if not username:
+        return None
+    return f"@{username}"
+
+
+async def _send_one_use_invite(bot: Bot, payer_id: int) -> bool:
+    chat_id = _channel_chat_id()
+    if chat_id is None:
+        return False
+    try:
+        created = await bot.create_chat_invite_link(chat_id, member_limit=1)
+    except Exception:
+        return False
+    link = created.invite_link
+    if not link:
+        return False
+    try:
+        await bot.send_message(payer_id, link, protect_content=True)
+    except Exception:
+        return False
+    return True
 
 
 def _pro_confirm_text() -> str:
@@ -1976,7 +2040,11 @@ def _quiz_connect() -> sqlite3.Connection:
             await_receipt INTEGER NOT NULL DEFAULT 0,
             quiz_used INTEGER NOT NULL DEFAULT 0,
             is_vip INTEGER NOT NULL DEFAULT 0,
-            vip_expires_at TEXT
+            vip_expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            paid_at TEXT,
+            expires_at TEXT,
+            reminder_sent INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -1989,7 +2057,30 @@ def _quiz_connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE access ADD COLUMN is_vip INTEGER NOT NULL DEFAULT 0")
     if "vip_expires_at" not in access_columns:
         conn.execute("ALTER TABLE access ADD COLUMN vip_expires_at TEXT")
+    added_expires = "expires_at" not in access_columns
+    if "status" not in access_columns:
+        conn.execute(
+            "ALTER TABLE access ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    if "paid_at" not in access_columns:
+        conn.execute("ALTER TABLE access ADD COLUMN paid_at TEXT")
+    if added_expires:
+        conn.execute("ALTER TABLE access ADD COLUMN expires_at TEXT")
+    if "reminder_sent" not in access_columns:
+        conn.execute(
+            "ALTER TABLE access ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute("UPDATE access SET is_vip = 1 WHERE pro = 1 AND is_vip = 0")
+    if added_expires:
+        _backfill_open_vip(conn)
+    conn.execute(
+        """
+        UPDATE access
+        SET expires_at = NULL, vip_expires_at = NULL
+        WHERE user_id = ?
+        """,
+        (ADMIN_ID,),
+    )
     conn.commit()
     return conn
 
@@ -2095,36 +2186,266 @@ def _ensure_access(conn: sqlite3.Connection, user_id: str) -> None:
     )
 
 
-def _expiry_passed(value: object) -> bool:
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def _parse_expiry(value: object) -> datetime | None:
     if value is None or str(value).strip() == "":
-        return False
+        return None
     text = str(value).strip().replace("Z", "+00:00")
     try:
         expires = datetime.fromisoformat(text)
     except ValueError:
-        return False
+        return None
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
-    return expires < datetime.now(timezone.utc)
+    return expires.astimezone(timezone.utc)
+
+
+def _expiry_passed(value: object) -> bool:
+    expires = _parse_expiry(value)
+    return expires is not None and expires <= _utc_now()
+
+
+class _RemoteVipError(Exception):
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _supabase_rest_base() -> str:
+    raw = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    host = parsed.hostname or ""
+    if host.endswith(".supabase.co"):
+        scheme = parsed.scheme or "https"
+        return f"{scheme}://{host}"
+    if parsed.scheme in {"http", "https"} and host and "." not in host:
+        return f"https://{host}.supabase.co"
+    return ""
+
+
+def _supabase_key() -> str:
+    return os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+
+def _remote_vip_enabled() -> bool:
+    return bool(_supabase_rest_base() and _supabase_key())
+
+
+def _remote_error_kind(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            payload = json.loads(exc.read().decode("utf-8", "replace"))
+            code = payload.get("code")
+            if code:
+                return str(code)
+        except Exception:
+            pass
+        return f"HTTP{exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        return type(reason).__name__ if reason is not None else "URLError"
+    return type(exc).__name__
+
+
+def _log_remote_failure(kind: str) -> None:
+    logging.getLogger("bot1.subscription").warning("VIP remote failed: %s", kind)
+
+
+def _remote_call(method: str, path: str, payload: dict | None = None, prefer: str | None = None) -> bytes:
+    base = _supabase_rest_base()
+    key = _supabase_key()
+    if not base or not key:
+        raise _RemoteVipError("not_configured")
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {
+        "apikey": key,
+        "Authorization": "Bearer " + key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise _RemoteVipError(_remote_error_kind(exc)) from None
+    except Exception as exc:
+        raise _RemoteVipError(_remote_error_kind(exc)) from None
+
+
+def _load_remote_vip(user_id: str) -> dict | None:
+    if not str(user_id).isdigit():
+        raise _RemoteVipError("bad_user_id")
+    raw = _remote_call(
+        "GET",
+        "/rest/v1/users?select=user_id,status,paid_at,expires_at,reminder_sent"
+        f"&user_id=eq.{int(user_id)}&limit=1",
+    )
+    rows = json.loads(raw.decode("utf-8") or "[]")
+    if not isinstance(rows, list) or not rows:
+        return None
+    return rows[0]
+
+
+def _list_remote_vips() -> list[dict]:
+    raw = _remote_call(
+        "GET",
+        "/rest/v1/users?select=user_id,status,paid_at,expires_at,reminder_sent"
+        f"&user_id=neq.{ADMIN_ID}&limit=1000",
+    )
+    rows = json.loads(raw.decode("utf-8") or "[]")
+    return rows if isinstance(rows, list) else []
+
+
+def _save_remote_vip(
+    user_id: str,
+    *,
+    status: str,
+    paid_at: str | None,
+    expires_at: str | None,
+    reminder_sent: bool,
+) -> None:
+    if str(user_id).strip() == ADMIN_ID or not str(user_id).isdigit():
+        return
+    _remote_call(
+        "POST",
+        "/rest/v1/users?on_conflict=user_id",
+        {
+            "user_id": int(user_id),
+            "status": status,
+            "paid_at": paid_at,
+            "expires_at": expires_at,
+            "reminder_sent": bool(reminder_sent),
+        },
+        "resolution=merge-duplicates,return=minimal",
+    )
+
+
+def _patch_remote_vip(user_id: str, fields: dict) -> None:
+    if str(user_id).strip() == ADMIN_ID or not str(user_id).isdigit():
+        return
+    _remote_call(
+        "PATCH",
+        f"/rest/v1/users?user_id=eq.{int(user_id)}",
+        fields,
+        "return=minimal",
+    )
+
+
+def _remote_term_active(row: dict) -> bool:
+    status = row.get("status") or "active"
+    expires = _parse_expiry(row.get("expires_at"))
+    return status == "active" and expires is not None and expires > _utc_now()
+
+
+def _backfill_open_vip(conn: sqlite3.Connection) -> None:
+    """Existing VIP with no end date gets one 30-day term. The owner stays open."""
+    until = _iso_utc(_utc_now() + timedelta(days=30))
+    conn.execute(
+        """
+        UPDATE access
+        SET expires_at = ?, vip_expires_at = ?, status = 'active', reminder_sent = 0
+        WHERE (is_vip = 1 OR pro = 1)
+          AND (expires_at IS NULL OR TRIM(expires_at) = '')
+          AND user_id != ?
+        """,
+        (until, until, ADMIN_ID),
+    )
+
+
+def _expire_user(conn: sqlite3.Connection, user_id: str) -> None:
+    if str(user_id).strip() == ADMIN_ID:
+        return
+    if _remote_vip_enabled():
+        try:
+            _patch_remote_vip(user_id, {"status": "expired"})
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+    conn.execute(
+        """
+        UPDATE access
+        SET status = 'expired', is_vip = 0, pro = 0
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    conn.commit()
+
+
+def _mirror_remote_vip(conn: sqlite3.Connection, user_id: str, row: dict, active: bool) -> None:
+    _ensure_access(conn, user_id)
+    reminder = 1 if bool(row.get("reminder_sent")) else 0
+    conn.execute(
+        """
+        UPDATE access
+        SET is_vip = ?, pro = ?, status = ?, paid_at = ?, expires_at = ?,
+            vip_expires_at = ?, reminder_sent = ?
+        WHERE user_id = ?
+        """,
+        (
+            1 if active else 0,
+            1 if active else 0,
+            row.get("status") or "active",
+            row.get("paid_at"),
+            row.get("expires_at"),
+            row.get("expires_at"),
+            reminder,
+            user_id,
+        ),
+    )
+    conn.commit()
 
 
 def _vip_active(conn: sqlite3.Connection, user_id: str) -> bool:
-    """Active VIP. NULL vip_expires_at is lifetime. A past expiry is cleared."""
+    """Active, unexpired VIP. 8091822446 never expires."""
+    if str(user_id).strip() == ADMIN_ID:
+        return True
     _ensure_access(conn, user_id)
+    if _remote_vip_enabled():
+        try:
+            remote = _load_remote_vip(user_id)
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+        else:
+            if remote is not None:
+                if _expiry_passed(remote.get("expires_at")):
+                    _expire_user(conn, user_id)
+                    return False
+                active = _remote_term_active(remote)
+                _mirror_remote_vip(conn, user_id, remote, active)
+                return active
     row = conn.execute(
-        "SELECT is_vip, vip_expires_at FROM access WHERE user_id = ?",
+        "SELECT is_vip, status, expires_at FROM access WHERE user_id = ?",
         (user_id,),
     ).fetchone()
-    if row is None or not int(row[0] or 0):
+    if row is None:
         return False
-    if _expiry_passed(row[1]):
-        conn.execute(
-            "UPDATE access SET is_vip = 0, pro = 0 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
+    is_vip = int(row[0] or 0)
+    status = row[1] or "active"
+    expires = _parse_expiry(row[2])
+    if expires is not None and expires <= _utc_now():
+        _expire_user(conn, user_id)
         return False
-    return True
+    if status == "active" and expires is not None and expires > _utc_now():
+        if not is_vip:
+            conn.execute(
+                "UPDATE access SET is_vip = 1, pro = 1 WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+        return True
+    return bool(is_vip) and status != "expired"
 
 
 def _is_pro(conn: sqlite3.Connection, user_id: str) -> bool:
@@ -2251,15 +2572,202 @@ def _set_await_receipt(conn: sqlite3.Connection, user_id: str, waiting: bool) ->
 
 def _grant_pro(conn: sqlite3.Connection, user_id: str) -> None:
     _ensure_access(conn, user_id)
+    if str(user_id).strip() == ADMIN_ID:
+        conn.execute(
+            """
+            UPDATE access
+            SET pro = 1, is_vip = 1, status = 'active',
+                expires_at = NULL, vip_expires_at = NULL,
+                reminder_sent = 0, await_receipt = 0
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        conn.commit()
+        return
+    now = _utc_now()
+    paid_at = _iso_utc(now)
+    expires_at = _iso_utc(now + timedelta(days=30))
     conn.execute(
         """
         UPDATE access
-        SET pro = 1, is_vip = 1, vip_expires_at = NULL, await_receipt = 0
+        SET pro = 1, is_vip = 1, status = 'active',
+            paid_at = ?, expires_at = ?, vip_expires_at = ?,
+            reminder_sent = 0, await_receipt = 0
         WHERE user_id = ?
         """,
+        (paid_at, expires_at, expires_at, user_id),
+    )
+    conn.commit()
+    if _remote_vip_enabled():
+        try:
+            _save_remote_vip(
+                user_id,
+                status="active",
+                paid_at=paid_at,
+                expires_at=expires_at,
+                reminder_sent=False,
+            )
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+
+
+def _due_user_ids(rows: list[tuple[str, object]]) -> list[str]:
+    now = _utc_now()
+    soon = now + timedelta(hours=24)
+    due: list[str] = []
+    for user_id, raw in rows:
+        if str(user_id).strip() == ADMIN_ID:
+            continue
+        expires = _parse_expiry(raw)
+        if expires is not None and now < expires <= soon:
+            due.append(str(user_id))
+    return due
+
+
+def _reminder_due(conn: sqlite3.Connection) -> list[str]:
+    if _remote_vip_enabled():
+        try:
+            remote_rows = [
+                (str(row.get("user_id")), row.get("expires_at"))
+                for row in _list_remote_vips()
+                if (row.get("status") or "active") == "active" and not bool(row.get("reminder_sent"))
+            ]
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+        else:
+            return _due_user_ids(remote_rows)
+    rows = conn.execute(
+        """
+        SELECT user_id, expires_at
+        FROM access
+        WHERE user_id != ?
+          AND status = 'active'
+          AND reminder_sent = 0
+          AND expires_at IS NOT NULL
+          AND TRIM(expires_at) != ''
+        """,
+        (ADMIN_ID,),
+    ).fetchall()
+    return _due_user_ids([(str(user_id), raw) for user_id, raw in rows])
+
+
+def _expire_lapsed(conn: sqlite3.Connection) -> int:
+    if _remote_vip_enabled():
+        try:
+            remote_rows = _list_remote_vips()
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+        else:
+            expired = 0
+            for row in remote_rows:
+                user_id = str(row.get("user_id") or "")
+                if user_id == ADMIN_ID or not _expiry_passed(row.get("expires_at")):
+                    continue
+                _expire_user(conn, user_id)
+                expired += 1
+            return expired
+    rows = conn.execute(
+        """
+        SELECT user_id, expires_at
+        FROM access
+        WHERE user_id != ?
+          AND expires_at IS NOT NULL
+          AND TRIM(expires_at) != ''
+        """,
+        (ADMIN_ID,),
+    ).fetchall()
+    expired = 0
+    for user_id, raw in rows:
+        if _expiry_passed(raw):
+            _expire_user(conn, str(user_id))
+            expired += 1
+    return expired
+
+
+def _mark_reminded(conn: sqlite3.Connection, user_id: str) -> None:
+    if str(user_id).strip() == ADMIN_ID:
+        return
+    if _remote_vip_enabled():
+        try:
+            _patch_remote_vip(user_id, {"reminder_sent": True})
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+            return
+    conn.execute(
+        "UPDATE access SET reminder_sent = 1 WHERE user_id = ?",
         (user_id,),
     )
     conn.commit()
+
+
+def _copy_sqlite_vip_to_remote(conn: sqlite3.Connection) -> None:
+    if not _remote_vip_enabled():
+        return
+    rows = conn.execute(
+        """
+        SELECT user_id, status, paid_at, expires_at, reminder_sent
+        FROM access
+        WHERE user_id != ?
+          AND (is_vip = 1 OR pro = 1)
+          AND expires_at IS NOT NULL
+          AND TRIM(expires_at) != ''
+        """,
+        (ADMIN_ID,),
+    ).fetchall()
+    for user_id, status, paid_at, expires_at, reminder_sent in rows:
+        try:
+            existing = _load_remote_vip(str(user_id))
+            if existing is not None:
+                continue
+            _save_remote_vip(
+                str(user_id),
+                status=status or "active",
+                paid_at=paid_at,
+                expires_at=expires_at,
+                reminder_sent=bool(int(reminder_sent or 0)),
+            )
+        except _RemoteVipError as exc:
+            _log_remote_failure(exc.kind)
+            return
+
+
+async def _subscription_pass() -> None:
+    with _quiz_lock:
+        conn = _quiz_connect()
+        try:
+            _copy_sqlite_vip_to_remote(conn)
+            due = _reminder_due(conn)
+            _expire_lapsed(conn)
+        finally:
+            conn.close()
+    for user_id in due:
+        try:
+            await bot1.send_message(int(user_id), VIP_REMINDER)
+        except Exception:
+            logging.getLogger("bot1.subscription").warning(
+                "VIP reminder was not delivered"
+            )
+            continue
+        with _quiz_lock:
+            conn = _quiz_connect()
+            try:
+                _mark_reminded(conn, user_id)
+            finally:
+                conn.close()
+
+
+async def _subscription_loop() -> None:
+    logging.getLogger("bot1.subscription").info(
+        "VIP store: %s",
+        "supabase" if _remote_vip_enabled() else "sqlite",
+    )
+    while True:
+        try:
+            await _subscription_pass()
+        except Exception:
+            logging.getLogger("bot1.subscription").exception("subscription check failed")
+        await asyncio.sleep(3600)
 
 
 def _vip_offer_keyboard() -> InlineKeyboardMarkup:
@@ -2620,11 +3128,10 @@ async def on_pro_approve(query: CallbackQuery) -> None:
             sent = await bot.send_message(int(payer), "🎉")
             await _edit_frames(sent, ("🎉✨",))
             await sent.edit_text(_pro_confirm_text(), reply_markup=_home_keyboard())
-            invite = _private_channel_url()
-            if invite:
-                await bot.send_message(int(payer), invite, reply_markup=_home_keyboard())
         except Exception:
             pass
+        if not await _send_one_use_invite(bot, int(payer)) and query.message is not None:
+            await query.message.answer(_INVITE_ADMIN_HINT)
     if query.message is not None:
         await query.message.answer(f"PRO қосылды: {payer}")
 
@@ -2949,4 +3456,5 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    asyncio.create_task(_subscription_loop())
     await dp1.start_polling(bot1)
