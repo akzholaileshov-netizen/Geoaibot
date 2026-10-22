@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import chromadb
@@ -196,6 +196,7 @@ _asked_users: set[str] | None = None
 _matrix: np.ndarray | None = None
 _docs: list[str] = []
 _metas: list[dict] = []
+_textbook_remote_cached: bool | None = None
 _last_search_query = ""
 
 
@@ -292,35 +293,60 @@ def _collection_names(client: chromadb.ClientAPI) -> set[str]:
     return names
 
 
+def _collection_recorded() -> bool:
+    """True when unt_geography_v2 is already stored. Does not start ingest."""
+    if _matrix is not None:
+        return True
+    db_path = CHROMA_DIR / "chroma.sqlite3"
+    if not db_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM collections WHERE name = ? LIMIT 1",
+            (COLLECTION_NAME,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is not None
+
+
+def _ingest_marked_running() -> bool:
+    return _ingest_proc is not None and _ingest_proc.poll() is None
+
+
 def _open_client() -> chromadb.ClientAPI | None:
     global _client
-    if not (CHROMA_DIR / "chroma.sqlite3").is_file():
+    if not _collection_recorded():
         return None
     if _client is None:
         _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    if COLLECTION_NAME not in _collection_names(_client):
-        return None
     return _client
 
 
 def _start_textbook_index() -> str:
-    """Start ingest.py once when its Chroma collection is missing.
+    """Start ingest.py once only when unt_geography_v2 is absent.
 
-    Returns ready, running, started, or failed. A later tap does not launch
-    another process while the first is alive or after the collection exists.
+    An existing collection is ready. A running ingest is not started again,
+    and it does not hide the collection from later questions.
     """
     global _client, _ingest_proc
-    if _matrix is not None or _open_client() is not None:
+    if _collection_recorded():
         return "ready"
     with _ingest_lock:
-        if _matrix is not None or _open_client() is not None:
+        if _collection_recorded():
             return "ready"
-        if _ingest_proc is not None and _ingest_proc.poll() is None:
+        if _ingest_marked_running():
             return "running"
         _client = None
         try:
             _ingest_proc = subprocess.Popen(
-                [sys.executable, str(ROOT / "ingest.py")],
+                ["python3", str(ROOT / "ingest.py")],
                 cwd=str(ROOT),
                 start_new_session=True,
             )
@@ -553,6 +579,152 @@ def _term_hits(text: str, terms: list[str]) -> int:
     return sum(1 for term in terms if term in low)
 
 
+def _vector_literal(values) -> str:
+    return "[" + ",".join(format(float(value), ".8g") for value in values) + "]"
+
+
+def _database_connect():
+    """Open the session pooler. The service role key is not required."""
+    raw = os.getenv("DATABASE_URL", "").strip()
+    if not raw:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        return None
+    try:
+        _scheme, rest = raw.split("://", 1)
+        creds, after = rest.rsplit("@", 1)
+        user_raw, password_raw = creds.split(":", 1)
+        host, rest_host = after.split(":", 1)
+        port_text, dbname = rest_host.split("/", 1)
+        return psycopg.connect(
+            host=host,
+            port=int(port_text),
+            user=unquote(user_raw),
+            password=unquote(password_raw),
+            dbname=dbname.split("?")[0],
+            sslmode="require",
+            connect_timeout=15,
+        )
+    except Exception:
+        return None
+
+
+def _textbook_chunk_count() -> int:
+    conn = _database_connect()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select count(*) from public.textbook_chunks")
+            row = cur.fetchone()
+    except Exception:
+        return 0
+    finally:
+        conn.close()
+    if not row:
+        return 0
+    return int(row[0])
+
+
+def _textbook_remote_ready() -> bool:
+    """True once textbook_chunks has rows. An empty table stays on local Chroma."""
+    global _textbook_remote_cached
+    if _textbook_remote_cached:
+        return True
+    try:
+        count = _textbook_chunk_count()
+    except Exception:
+        return False
+    if count > 0:
+        _textbook_remote_cached = True
+        return True
+    return False
+
+
+def _match_textbook_chunks(vector, match_count: int) -> list[dict] | None:
+    conn = _database_connect()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select id, content, source, page, similarity
+                from public.match_textbook_chunks(%s::extensions.vector(3072), %s)
+                """,
+                (_vector_literal(vector), int(match_count)),
+            )
+            found = cur.fetchall()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+    return [
+        {
+            "id": row[0],
+            "content": row[1],
+            "source": row[2],
+            "page": row[3],
+            "similarity": row[4],
+        }
+        for row in found
+    ]
+
+
+def _remote_candidate_pool(
+    question: str, api_key: str, k: int, also: str = ""
+) -> list[tuple[Document, float]] | None:
+    """Cosine neighbors from textbook_chunks. Citations still use source and page."""
+    embeddings = get_embeddings(api_key)
+    forms = _query_forms(question)
+    if also and also != question:
+        for form in _query_forms(also):
+            if form not in forms:
+                forms.append(form)
+    vectors = [np.asarray(embeddings.embed_query(question), dtype=np.float32)]
+    vectors.extend(
+        np.asarray(row, dtype=np.float32) for row in embeddings.embed_documents(forms)
+    )
+    best: dict[str, tuple[Document, float]] = {}
+    fetch_n = max(k, MMR_CANDIDATES)
+    for vector in vectors:
+        rows = _match_textbook_chunks(vector, fetch_n)
+        if rows is None:
+            return None
+        for row in rows:
+            text = str(row.get("content") or "")
+            if not _usable(text):
+                continue
+            try:
+                score = float(row.get("similarity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if score < SOFT_MIN_COSINE:
+                continue
+            doc = Document(
+                page_content=text,
+                metadata={"source": row.get("source") or "", "page": row.get("page")},
+            )
+            chunk_id = str(row.get("id") or id(doc))
+            previous = best.get(chunk_id)
+            if previous is None or score > previous[1]:
+                best[chunk_id] = (doc, score)
+    ranked = sorted(best.values(), key=lambda item: item[1], reverse=True)
+    hits: list[tuple[Document, float]] = []
+    seen: set[str] = set()
+    for doc, score in ranked:
+        body = doc.page_content.strip()
+        if body in seen:
+            continue
+        seen.add(body)
+        hits.append((doc, score))
+        if len(hits) >= k:
+            break
+    return hits
+
+
 def retrieve(
     question: str, api_key: str, k: int = TOP_K
 ) -> list[tuple[Document, float]] | None:
@@ -574,6 +746,8 @@ def candidate_pool(
     question: str, api_key: str, k: int = TOP_K, also: str = ""
 ) -> list[tuple[Document, float]] | None:
     """Semantic neighbors. A keyword or a synonym never drops one of them."""
+    if _textbook_remote_ready():
+        return _remote_candidate_pool(question, api_key, k, also)
     scores = _query_scores(question, api_key, also)
     if scores is None:
         return None
@@ -1616,6 +1790,8 @@ async def answer_question(question: str, api_key: str) -> str:
         candidate_pool, search_query, api_key, RAG_TOP_K, question
     )
     if found is None:
+        if _textbook_remote_ready() or _collection_recorded():
+            return API_ERROR
         return PREPARING_DB
     if not found:
         return _not_found_answer()
@@ -3184,14 +3360,12 @@ async def on_ask_mode(query: CallbackQuery) -> None:
             finally:
                 conn.close()
     index_state = _start_textbook_index()
-    if index_state != "ready":
-        if query.message is not None:
-            await query.message.answer(
-                API_ERROR if index_state == "failed" else PREPARING_DB
-            )
+    if query.message is None:
         return
-    if query.message is not None:
+    if index_state == "ready":
         await query.message.answer(_ask_intro_for(sender.id if sender is not None else None))
+        return
+    await query.message.answer(PREPARING_DB)
 
 
 @router.callback_query(F.data == "mode:quiz")
@@ -3428,39 +3602,18 @@ async def on_receipt(message: Message) -> None:
     await message.answer("Чек жіберілді. Растауды күтіңіз.")
 
 
-@router.message()
-async def on_question(message: Message, api_key: str) -> None:
-    question = (message.text or "").strip()
-    if not question or question.startswith("/"):
-        return
-    sender = message.from_user
-    user_id = str(sender.id) if sender is not None else ""
-    if user_id:
-        with _quiz_lock:
-            conn = _quiz_connect()
-            try:
-                mode = _quiz_row(conn, user_id)["mode"]
-            finally:
-                conn.close()
-        if mode == "quiz":
-            await _handle_quiz_answer(message, user_id, question, api_key)
-            return
-        status = _claim_section(user_id, "ask")
-        if status == "busy":
-            return
-        if status != "ok":
-            await _answer_free_empty(message)
-            return
-    else:
-        status = "ok"
+async def _answer_from_books(message: Message, question: str, api_key: str) -> None:
+    """Always send a reply. An existing collection is searched even if ingest is marked running."""
     bot = message.bot
     if bot is None:
-        if user_id:
-            _release_section(user_id, "ask")
         await message.answer(API_ERROR)
         return
     try:
         pending = await message.answer(THINKING)
+    except Exception:
+        await message.answer(API_ERROR)
+        return
+    try:
         # Telegram clears "typing" after about 5 seconds, so refresh it until the reply is sent.
         async with ChatActionSender(
             bot=bot,
@@ -3469,15 +3622,50 @@ async def on_question(message: Message, api_key: str) -> None:
             interval=TYPING_INTERVAL,
             initial_sleep=0,
         ):
-            try:
-                if _open_client() is None:
-                    await _deliver_answer(pending, PREPARING_DB)
-                    return
-                await _deliver_answer(pending, await answer_question(question, api_key))
-            except Exception:
-                await _deliver_answer(pending, API_ERROR)
-    finally:
+            if _textbook_remote_ready() or _collection_recorded():
+                text = await answer_question(question, api_key)
+            else:
+                text = PREPARING_DB
+            await _deliver_answer(pending, text)
+    except Exception:
+        try:
+            await _deliver_answer(pending, API_ERROR)
+        except Exception:
+            await message.answer(API_ERROR)
+
+
+@router.message()
+async def on_question(message: Message, api_key: str) -> None:
+    question = (message.text or "").strip()
+    if not question or question.startswith("/"):
+        return
+    sender = message.from_user
+    user_id = str(sender.id) if sender is not None else ""
+    claimed = False
+    try:
         if user_id:
+            with _quiz_lock:
+                conn = _quiz_connect()
+                try:
+                    mode = _quiz_row(conn, user_id)["mode"]
+                finally:
+                    conn.close()
+            if mode == "quiz":
+                await _handle_quiz_answer(message, user_id, question, api_key)
+                return
+            status = _claim_section(user_id, "ask")
+            if status == "busy":
+                await _answer_from_books(message, question, api_key)
+                return
+            if status != "ok":
+                await _answer_free_empty(message)
+                return
+            claimed = True
+        await _answer_from_books(message, question, api_key)
+    except Exception:
+        await message.answer(API_ERROR)
+    finally:
+        if claimed:
             _release_section(user_id, "ask")
 
 
