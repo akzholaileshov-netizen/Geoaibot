@@ -1889,7 +1889,7 @@ PRO_COMPARE = (
     "🔒 Толық база жабық VIP-каналда!\n"
     "Жеке репетитор — 25 000 ₸/ай ❌\n"
     "Курстар — 35 000 ₸/ай ❌\n"
-    "GeoAI Премиум (19 оқулық + 3000 сұрақтық база) — бары-жоғы 4 990 ₸ ✅"
+    "GeoAI Премиум (19 оқулық + 3000 сұрақтық база) — бары-жоғы 2 000 ₸ ✅"
 )
 LIMIT_CLOSED = (
     "🔒 Сенің тегін лимитің аяқталды! 3000+ сұрақ пен 19 оқулықтың базасын "
@@ -2137,7 +2137,7 @@ def _pay_html() -> str:
         [
             html.escape(PRO_COMPARE),
             "",
-            html.escape("⭐ PRO деңгей — 4990 тг"),
+            html.escape("⭐ PRO деңгей — 2 000 ₸"),
             html.escape("Реквизиттер (Kaspi):"),
             html.escape("💳 Карта: ") + f"<code>{CARD_DIGITS}</code>",
             html.escape("👤 Алушы: Ақжол Әйлеш"),
@@ -2983,7 +2983,7 @@ async def _subscription_loop() -> None:
 def _vip_offer_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 VIP Доступ алу (4 990 ₸)", callback_data="pay:open")],
+            [InlineKeyboardButton(text="💳 VIP Доступ алу (2 000 ₸)", callback_data="pay:open")],
         ]
     )
 
